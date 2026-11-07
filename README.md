@@ -26,4 +26,6 @@ curl http://127.0.0.1:8080/health
 
 `POST /generate` accepts up to 8192 bytes of UTF-8 plain text and returns the full generated text, including the prompt. Sampling options are fixed when the server starts. Requests run sequentially so one model and its KV buffers can be reused safely. Prefix caching is not implemented yet; each request currently starts at position zero.
 
+`Transformer` owns an empty `PrefixCache` with exact token-sequence keys and K/V entry storage. Lookup and restoration are not wired into generation yet.
+
 The HTTP layer uses [`tiny_http`](https://docs.rs/tiny_http/) and checkpoint mapping uses [`memmap2`](https://docs.rs/memmap2/).

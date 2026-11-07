@@ -1,3 +1,4 @@
+use crate::cache::PrefixCache;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io;
@@ -134,6 +135,8 @@ pub struct Transformer {
     mmap: Mmap,
     weights: Weights,
     state: State,
+    #[allow(dead_code)] // generation will use this in the cache integration step
+    pub prefix_cache: PrefixCache,
 }
 
 impl Transformer {
@@ -173,6 +176,7 @@ impl Transformer {
             mmap,
             weights,
             state,
+            prefix_cache: PrefixCache::default(),
         })
     }
 
