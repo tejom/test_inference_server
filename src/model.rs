@@ -1,4 +1,4 @@
-use crate::cache::PrefixCache;
+use crate::cache::{CacheEntry, KvTensor, PrefixCache};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io;
@@ -130,12 +130,27 @@ impl State {
     }
 }
 
+fn snapshot_kv(c: Config, state: &State, len: usize) -> CacheEntry {
+    let kv_dim = c.kv_dim();
+    let mut keys = KvTensor::new(c.layers, len, kv_dim);
+    let mut values = KvTensor::new(c.layers, len, kv_dim);
+    for layer in 0..c.layers {
+        let start = layer * c.seq_len * kv_dim;
+        let end = start + len * kv_dim;
+        keys.layer_mut(layer)
+            .copy_from_slice(&state.keys[start..end]);
+        values
+            .layer_mut(layer)
+            .copy_from_slice(&state.values[start..end]);
+    }
+    CacheEntry { keys, values }
+}
+
 pub struct Transformer {
     pub config: Config,
     mmap: Mmap,
     weights: Weights,
     state: State,
-    #[allow(dead_code)] // generation will use this in the cache integration step
     pub prefix_cache: PrefixCache,
 }
 
@@ -178,6 +193,16 @@ impl Transformer {
             state,
             prefix_cache: PrefixCache::default(),
         })
+    }
+
+    /// Save the already processed positions in `tokens` as a full prefix snapshot.
+    pub fn cache_prefix(&mut self, tokens: &[usize]) {
+        let len = tokens.len();
+        if len == 0 || len > self.config.seq_len || self.prefix_cache.get(tokens).is_some() {
+            return;
+        }
+        let entry = snapshot_kv(self.config, &self.state, len);
+        self.prefix_cache.insert(tokens.to_vec(), entry);
     }
 
     pub fn forward(&mut self, token: usize, pos: usize) -> &[f32] {
@@ -338,5 +363,36 @@ fn softmax(values: &mut [f32]) {
     }
     for value in values {
         *value /= sum;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_uses_compact_layer_stride() {
+        let c = Config {
+            dim: 4,
+            hidden_dim: 4,
+            layers: 2,
+            heads: 1,
+            kv_heads: 1,
+            vocab: 8,
+            seq_len: 4,
+        };
+        let mut state = State::new(c).unwrap();
+        for (i, value) in state.keys.iter_mut().enumerate() {
+            *value = i as f32;
+        }
+        for (i, value) in state.values.iter_mut().enumerate() {
+            *value = 100.0 + i as f32;
+        }
+
+        let snapshot = snapshot_kv(c, &state, 2);
+        assert_eq!(snapshot.keys.layer(0), &state.keys[0..8]);
+        assert_eq!(snapshot.keys.layer(1), &state.keys[16..24]);
+        assert_eq!(snapshot.values.layer(0), &state.values[0..8]);
+        assert_eq!(snapshot.values.layer(1), &state.values[16..24]);
     }
 }

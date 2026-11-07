@@ -18,6 +18,7 @@ struct Options {
     prompt: Option<String>,
     system_prompt: Option<String>,
     steps: usize,
+    cache_chunk_size: usize,
     temperature: f32,
     topp: f32,
     seed: u64,
@@ -38,6 +39,7 @@ impl Options {
             prompt: None,
             system_prompt: None,
             steps: 256,
+            cache_chunk_size: 8,
             temperature: 1.0,
             topp: 0.9,
             seed: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -51,6 +53,7 @@ impl Options {
                 "-i" => options.prompt = Some(value),
                 "-y" => options.system_prompt = Some(value),
                 "-n" => options.steps = value.parse()?,
+                "-C" => options.cache_chunk_size = value.parse()?,
                 "-t" => options.temperature = value.parse()?,
                 "-p" => options.topp = value.parse()?,
                 "-s" => options.seed = value.parse()?,
@@ -147,6 +150,7 @@ fn generate(
     sampler: &mut Sampler,
     prompt: &str,
     steps: usize,
+    cache_chunk_size: usize,
 ) -> Vec<u8> {
     let prompt_tokens = tokenizer.encode(prompt);
     let mut output = Vec::new();
@@ -160,6 +164,12 @@ fn generate(
         };
         if next == 1 {
             break;
+        }
+        if cache_chunk_size > 0
+            && pos + 1 < prompt_tokens.len()
+            && (pos + 1) % cache_chunk_size == 0
+        {
+            model.cache_prefix(&prompt_tokens[..pos + 1]);
         }
         output.extend(tokenizer.decode(token, next));
         token = next;
@@ -253,6 +263,7 @@ fn serve(
     tokenizer: &Tokenizer,
     sampler: &mut Sampler,
     steps: usize,
+    cache_chunk_size: usize,
     port: u16,
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let address = format!("127.0.0.1:{port}");
@@ -267,9 +278,10 @@ fn serve(
                 match limited.read_to_end(&mut body) {
                     Ok(_) if body.len() > 8192 => response(b"prompt too large\n".to_vec(), 413),
                     Ok(_) => match String::from_utf8(body) {
-                        Ok(prompt) if !prompt.contains('\0') => {
-                            response(generate(model, tokenizer, sampler, &prompt, steps), 200)
-                        }
+                        Ok(prompt) if !prompt.contains('\0') => response(
+                            generate(model, tokenizer, sampler, &prompt, steps, cache_chunk_size),
+                            200,
+                        ),
                         _ => response(b"prompt must be UTF-8 without NUL\n".to_vec(), 400),
                     },
                     Err(_) => response(b"failed to read prompt\n".to_vec(), 400),
@@ -306,12 +318,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &mut sampler,
                 options.prompt.as_deref().unwrap_or(""),
                 steps,
+                options.cache_chunk_size,
             );
             io::stdout().write_all(&output)?;
         }
         "chat" => chat(&mut model, &tokenizer, &mut sampler, &options, steps)?,
-        "server" => serve(&mut model, &tokenizer, &mut sampler, steps, options.port)
-            .map_err(|e| -> Box<dyn Error> { e })?,
+        "server" => serve(
+            &mut model,
+            &tokenizer,
+            &mut sampler,
+            steps,
+            options.cache_chunk_size,
+            options.port,
+        )
+        .map_err(|e| -> Box<dyn Error> { e })?,
         _ => return Err(format!("unknown mode: {}", options.mode).into()),
     }
     Ok(())
