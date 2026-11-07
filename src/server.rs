@@ -1,7 +1,8 @@
 //! Synchronous HTTP request/reply plumbing for the model worker.
 
+use crate::generation::step_request;
 use crate::model::Transformer;
-use crate::request::generate;
+use crate::request::RequestState;
 use crate::tokenizer::Tokenizer;
 use crate::Sampler;
 use std::collections::HashMap;
@@ -79,14 +80,19 @@ fn model_worker(
     reply_tx: Sender<ModelReply>,
 ) {
     for work in work_rx {
-        let body = generate(
-            &mut model,
+        let mut request = RequestState::new(
+            &model,
             &tokenizer,
-            &mut sampler,
+            sampler.clone(),
             &work.prompt,
             work.steps,
             cache_chunk_size,
         );
+        while !request.is_done() {
+            step_request(&mut model, &tokenizer, &mut request);
+        }
+        let (body, next_sampler) = request.into_result();
+        sampler = next_sampler;
         if reply_tx
             .send(ModelReply {
                 id: work.id,
