@@ -1,16 +1,16 @@
 mod cache;
 mod model;
-#[allow(dead_code)] // The scheduled server scaffold is not connected to serve() yet.
+#[allow(dead_code)] // Fields reserved for the upcoming scheduler.
 mod server;
 mod tokenizer;
 
 use model::Transformer;
 use std::env;
 use std::error::Error;
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tiny_http::{Header, Method, Response, Server, StatusCode};
+use tiny_http::{Header, Response, Server as HttpServer, StatusCode};
 use tokenizer::Tokenizer;
 
 struct Options {
@@ -271,44 +271,6 @@ fn response(body: impl Into<Vec<u8>>, status: u16) -> Response<std::io::Cursor<V
         .with_header(Header::from_bytes("Content-Type", "text/plain; charset=utf-8").unwrap())
 }
 
-fn serve(
-    model: &mut Transformer,
-    tokenizer: &Tokenizer,
-    sampler: &mut Sampler,
-    steps: usize,
-    cache_chunk_size: usize,
-    port: u16,
-) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let address = format!("127.0.0.1:{port}");
-    let server = Server::http(&address)?;
-    eprintln!("Listening on http://{address}");
-    for mut request in server.incoming_requests() {
-        let answer = match (request.method(), request.url()) {
-            (&Method::Get, "/health") => response(b"ok\n".to_vec(), 200),
-            (&Method::Post, "/generate") => {
-                let mut body = Vec::new();
-                let mut limited = request.as_reader().take(8193);
-                match limited.read_to_end(&mut body) {
-                    Ok(_) if body.len() > 8192 => response(b"prompt too large\n".to_vec(), 413),
-                    Ok(_) => match String::from_utf8(body) {
-                        Ok(prompt) if !prompt.contains('\0') => response(
-                            generate(model, tokenizer, sampler, &prompt, steps, cache_chunk_size),
-                            200,
-                        ),
-                        _ => response(b"prompt must be UTF-8 without NUL\n".to_vec(), 400),
-                    },
-                    Err(_) => response(b"failed to read prompt\n".to_vec(), 400),
-                }
-            }
-            _ => response(b"not found\n".to_vec(), 404),
-        };
-        if let Err(error) = request.respond(answer) {
-            eprintln!("response error: {error}");
-        }
-    }
-    Ok(())
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let options = Options::parse()?;
     let mut model = Transformer::load(&options.checkpoint)?;
@@ -336,15 +298,37 @@ fn main() -> Result<(), Box<dyn Error>> {
             io::stdout().write_all(&output)?;
         }
         "chat" => chat(&mut model, &tokenizer, &mut sampler, &options, steps)?,
-        "server" => serve(
-            &mut model,
-            &tokenizer,
-            &mut sampler,
-            steps,
-            options.cache_chunk_size,
-            options.port,
-        )
-        .map_err(|e| -> Box<dyn Error> { e })?,
+        "server" => {
+            let address = format!("127.0.0.1:{}", options.port);
+            let http = HttpServer::http(&address).map_err(|e| -> Box<dyn Error> { e })?;
+            eprintln!("Listening on http://{address}");
+            let server = server::Server::new(http, move |work_rx, reply_tx| {
+                for work in work_rx {
+                    let body = generate(
+                        &mut model,
+                        &tokenizer,
+                        &mut sampler,
+                        &work.prompt,
+                        work.steps,
+                        work.cache_chunk_size,
+                    );
+                    if reply_tx
+                        .send(server::ModelReply {
+                            id: work.id,
+                            status: 200,
+                            body,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            server.serve(steps, options.cache_chunk_size);
+            if server.shutdown().is_err() {
+                return Err("server worker panicked".into());
+            }
+        }
         _ => return Err(format!("unknown mode: {}", options.mode).into()),
     }
     Ok(())

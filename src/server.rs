@@ -1,14 +1,13 @@
-//! Synchronous request/reply plumbing for a future scheduled model worker.
-//!
-//! This module is intentionally not used by the current `serve` function yet.
+//! Synchronous HTTP request/reply plumbing for the model worker.
 
 use std::collections::HashMap;
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
-use tiny_http::{Request, Server as HttpServer};
+use tiny_http::{Method, Request, Server as HttpServer};
 
 pub type RequestId = u64;
 
@@ -23,6 +22,8 @@ pub struct ModelRequest {
     pub id: RequestId,
     pub prompt: String,
     pub received_at: Instant,
+    pub steps: usize,
+    pub cache_chunk_size: usize,
 }
 
 /// A completed model result sent back to the HTTP reply worker.
@@ -78,12 +79,60 @@ impl Server {
         }
     }
 
+    /// Accepts HTTP requests and sends valid generation work to the model thread.
+    pub fn serve(&self, steps: usize, cache_chunk_size: usize) {
+        for mut request in self.http.incoming_requests() {
+            match (request.method(), request.url()) {
+                (&Method::Get, "/health") => {
+                    if let Err(error) = request.respond(crate::response(b"ok\n".to_vec(), 200)) {
+                        eprintln!("response error: {error}");
+                    }
+                }
+                (&Method::Post, "/generate") => {
+                    let mut body = Vec::new();
+                    let mut limited = request.as_reader().take(8193);
+                    let prompt = match limited.read_to_end(&mut body) {
+                        Ok(_) if body.len() > 8192 => Err((413, b"prompt too large\n".to_vec())),
+                        Ok(_) => match String::from_utf8(body) {
+                            Ok(prompt) if !prompt.contains('\0') => Ok(prompt),
+                            _ => Err((400, b"prompt must be UTF-8 without NUL\n".to_vec())),
+                        },
+                        Err(_) => Err((400, b"failed to read prompt\n".to_vec())),
+                    };
+                    match prompt {
+                        Ok(prompt) => {
+                            if let Err(error) =
+                                self.enqueue(request, prompt, steps, cache_chunk_size)
+                            {
+                                eprintln!("model worker unavailable: {error}");
+                            }
+                        }
+                        Err((status, body)) => {
+                            if let Err(error) = request.respond(crate::response(body, status)) {
+                                eprintln!("response error: {error}");
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    if let Err(error) =
+                        request.respond(crate::response(b"not found\n".to_vec(), 404))
+                    {
+                        eprintln!("response error: {error}");
+                    }
+                }
+            }
+        }
+    }
+
     /// Registers the HTTP request before enqueuing its model work so an early
     /// reply can always find the corresponding connection.
     pub fn enqueue(
         &self,
         request: Request,
         prompt: String,
+        steps: usize,
+        cache_chunk_size: usize,
     ) -> Result<RequestId, mpsc::SendError<ModelRequest>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let received_at = Instant::now();
@@ -98,6 +147,8 @@ impl Server {
             id,
             prompt,
             received_at,
+            steps,
+            cache_chunk_size,
         };
         if let Err(error) = self.work_tx.send(work) {
             let pending_request = self.pending.lock().unwrap().remove(&id);
