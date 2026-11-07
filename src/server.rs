@@ -1,5 +1,8 @@
 //! Synchronous HTTP request/reply plumbing for the model worker.
 
+use crate::model::Transformer;
+use crate::tokenizer::Tokenizer;
+use crate::{generate, Sampler};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Read;
@@ -8,7 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
-use tiny_http::{Method, Request, Server as HttpServer};
+use tiny_http::{Header, Method, Request, Response, Server as HttpServer, StatusCode};
 
 pub type RequestId = u64;
 
@@ -43,12 +46,68 @@ pub struct Server {
     reply_thread: JoinHandle<()>,
 }
 
+fn response(body: impl Into<Vec<u8>>, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
+    Response::from_data(body.into())
+        .with_status_code(StatusCode(status))
+        .with_header(Header::from_bytes("Content-Type", "text/plain; charset=utf-8").unwrap())
+}
+
+fn reply_worker(
+    pending: Arc<Mutex<HashMap<RequestId, PendingHttpRequest>>>,
+    reply_rx: Receiver<ModelReply>,
+) {
+    for reply in reply_rx {
+        let pending_request = pending.lock().unwrap().remove(&reply.id);
+        if let Some(pending_request) = pending_request {
+            if let Err(error) = pending_request
+                .request
+                .respond(response(reply.body, reply.status))
+            {
+                eprintln!("response error: {error}");
+            }
+        }
+    }
+}
+
+fn model_worker(
+    mut model: Transformer,
+    tokenizer: Tokenizer,
+    mut sampler: Sampler,
+    cache_chunk_size: usize,
+    work_rx: Receiver<ModelRequest>,
+    reply_tx: Sender<ModelReply>,
+) {
+    for work in work_rx {
+        let body = generate(
+            &mut model,
+            &tokenizer,
+            &mut sampler,
+            &work.prompt,
+            work.steps,
+            cache_chunk_size,
+        );
+        if reply_tx
+            .send(ModelReply {
+                id: work.id,
+                status: 200,
+                body,
+            })
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
 impl Server {
-    /// Starts the model and reply threads with the supplied model worker loop.
-    pub fn new<F>(port: u16, model_worker: F) -> Result<Self, Box<dyn Error>>
-    where
-        F: FnOnce(Receiver<ModelRequest>, Sender<ModelReply>) + Send + 'static,
-    {
+    /// Starts the model and reply threads.
+    pub fn new(
+        port: u16,
+        model: Transformer,
+        tokenizer: Tokenizer,
+        sampler: Sampler,
+        cache_chunk_size: usize,
+    ) -> Result<Self, Box<dyn Error>> {
         let address = format!("127.0.0.1:{port}");
         let http = HttpServer::http(&address).map_err(|e| -> Box<dyn Error> { e })?;
         eprintln!("Listening on http://{address}");
@@ -57,20 +116,17 @@ impl Server {
         let (reply_tx, reply_rx) = mpsc::channel::<ModelReply>();
 
         let reply_pending = Arc::clone(&pending);
-        let reply_thread = thread::spawn(move || {
-            for reply in reply_rx {
-                let pending_request = reply_pending.lock().unwrap().remove(&reply.id);
-                if let Some(pending_request) = pending_request {
-                    if let Err(error) = pending_request
-                        .request
-                        .respond(crate::response(reply.body, reply.status))
-                    {
-                        eprintln!("response error: {error}");
-                    }
-                }
-            }
+        let reply_thread = thread::spawn(move || reply_worker(reply_pending, reply_rx));
+        let model_thread = thread::spawn(move || {
+            model_worker(
+                model,
+                tokenizer,
+                sampler,
+                cache_chunk_size,
+                work_rx,
+                reply_tx,
+            )
         });
-        let model_thread = thread::spawn(move || model_worker(work_rx, reply_tx));
 
         Ok(Self {
             http,
@@ -87,7 +143,7 @@ impl Server {
         for mut request in self.http.incoming_requests() {
             match (request.method(), request.url()) {
                 (&Method::Get, "/health") => {
-                    if let Err(error) = request.respond(crate::response(b"ok\n".to_vec(), 200)) {
+                    if let Err(error) = request.respond(response(b"ok\n".to_vec(), 200)) {
                         eprintln!("response error: {error}");
                     }
                 }
@@ -109,16 +165,14 @@ impl Server {
                             }
                         }
                         Err((status, body)) => {
-                            if let Err(error) = request.respond(crate::response(body, status)) {
+                            if let Err(error) = request.respond(response(body, status)) {
                                 eprintln!("response error: {error}");
                             }
                         }
                     }
                 }
                 _ => {
-                    if let Err(error) =
-                        request.respond(crate::response(b"not found\n".to_vec(), 404))
-                    {
+                    if let Err(error) = request.respond(response(b"not found\n".to_vec(), 404)) {
                         eprintln!("response error: {error}");
                     }
                 }
@@ -154,7 +208,7 @@ impl Server {
             if let Some(pending_request) = pending_request {
                 let _ = pending_request
                     .request
-                    .respond(crate::response(b"model worker unavailable\n".to_vec(), 503));
+                    .respond(response(b"model worker unavailable\n".to_vec(), 503));
             }
             return Err(error);
         }

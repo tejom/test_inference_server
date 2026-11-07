@@ -10,7 +10,6 @@ use std::error::Error;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tiny_http::{Header, Response, StatusCode};
 use tokenizer::Tokenizer;
 
 struct Options {
@@ -265,12 +264,6 @@ fn chat(
     Ok(())
 }
 
-fn response(body: impl Into<Vec<u8>>, status: u16) -> Response<std::io::Cursor<Vec<u8>>> {
-    Response::from_data(body.into())
-        .with_status_code(StatusCode(status))
-        .with_header(Header::from_bytes("Content-Type", "text/plain; charset=utf-8").unwrap())
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     let options = Options::parse()?;
     let mut model = Transformer::load(&options.checkpoint)?;
@@ -299,29 +292,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         "chat" => chat(&mut model, &tokenizer, &mut sampler, &options, steps)?,
         "server" => {
-            let cache_chunk_size = options.cache_chunk_size;
-            let server = server::Server::new(options.port, move |work_rx, reply_tx| {
-                for work in work_rx {
-                    let body = generate(
-                        &mut model,
-                        &tokenizer,
-                        &mut sampler,
-                        &work.prompt,
-                        work.steps,
-                        cache_chunk_size,
-                    );
-                    if reply_tx
-                        .send(server::ModelReply {
-                            id: work.id,
-                            status: 200,
-                            body,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })?;
+            let server = server::Server::new(
+                options.port,
+                model,
+                tokenizer,
+                sampler,
+                options.cache_chunk_size,
+            )?;
             server.serve(steps);
             if server.shutdown().is_err() {
                 return Err("server worker panicked".into());
