@@ -302,6 +302,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let address = format!("127.0.0.1:{}", options.port);
             let http = HttpServer::http(&address).map_err(|e| -> Box<dyn Error> { e })?;
             eprintln!("Listening on http://{address}");
+            let cache_chunk_size = options.cache_chunk_size;
             let server = server::Server::new(http, move |work_rx, reply_tx| {
                 for work in work_rx {
                     let body = generate(
@@ -310,7 +311,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         &mut sampler,
                         &work.prompt,
                         work.steps,
-                        work.cache_chunk_size,
+                        cache_chunk_size,
                     );
                     if reply_tx
                         .send(server::ModelReply {
@@ -324,7 +325,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     }
                 }
             });
-            server.serve(steps, options.cache_chunk_size);
+            server.serve(steps);
             if server.shutdown().is_err() {
                 return Err("server worker panicked".into());
             }

@@ -23,7 +23,6 @@ pub struct ModelRequest {
     pub prompt: String,
     pub received_at: Instant,
     pub steps: usize,
-    pub cache_chunk_size: usize,
 }
 
 /// A completed model result sent back to the HTTP reply worker.
@@ -80,7 +79,7 @@ impl Server {
     }
 
     /// Accepts HTTP requests and sends valid generation work to the model thread.
-    pub fn serve(&self, steps: usize, cache_chunk_size: usize) {
+    pub fn serve(&self, steps: usize) {
         for mut request in self.http.incoming_requests() {
             match (request.method(), request.url()) {
                 (&Method::Get, "/health") => {
@@ -101,9 +100,7 @@ impl Server {
                     };
                     match prompt {
                         Ok(prompt) => {
-                            if let Err(error) =
-                                self.enqueue(request, prompt, steps, cache_chunk_size)
-                            {
+                            if let Err(error) = self.enqueue(request, prompt, steps) {
                                 eprintln!("model worker unavailable: {error}");
                             }
                         }
@@ -132,7 +129,6 @@ impl Server {
         request: Request,
         prompt: String,
         steps: usize,
-        cache_chunk_size: usize,
     ) -> Result<RequestId, mpsc::SendError<ModelRequest>> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let received_at = Instant::now();
@@ -148,7 +144,6 @@ impl Server {
             prompt,
             received_at,
             steps,
-            cache_chunk_size,
         };
         if let Err(error) = self.work_tx.send(work) {
             let pending_request = self.pending.lock().unwrap().remove(&id);
