@@ -99,7 +99,7 @@ impl Config {
     }
 }
 
-struct State {
+pub struct State {
     x: Vec<f32>,
     xb: Vec<f32>,
     xb2: Vec<f32>,
@@ -189,7 +189,6 @@ pub struct Transformer {
     pub config: Config,
     mmap: Mmap,
     weights: Weights,
-    state: State,
     pub prefix_cache: PrefixCache,
 }
 
@@ -224,19 +223,24 @@ impl Transformer {
             return Err(invalid_checkpoint());
         }
         let weights = Weights::new(c, raw[5] > 0, mmap.len() / 4)?;
-        let state = State::new(c)?;
+        product(&[c.layers, c.seq_len, c.kv_dim()])?;
+        product(&[c.heads, c.seq_len])?;
         Ok(Self {
             config: c,
             mmap,
             weights,
-            state,
             prefix_cache: PrefixCache::default(),
         })
+    }
+
+    pub fn new_state(&self) -> State {
+        State::new(self.config).expect("model dimensions were checked when loaded")
     }
 
     /// Save one processed K/V block, returning its stable ID for the next block.
     pub fn cache_block(
         &mut self,
+        state: &State,
         parent_id: Option<BlockId>,
         tokens: &[usize],
         start_pos: usize,
@@ -249,20 +253,21 @@ impl Transformer {
         if let Some(entry) = self.prefix_cache.get(&key) {
             return entry.id;
         }
-        let (keys, values) = snapshot_kv(self.config, &self.state, start_pos, tokens.len());
+        let (keys, values) = snapshot_kv(self.config, state, start_pos, tokens.len());
         self.prefix_cache.insert(key, keys, values)
     }
 
     /// Restore the longest chain of matching full blocks from the prompt start.
     pub fn restore_cached_prefix(
-        &mut self,
+        &self,
+        state: &mut State,
         prompt_tokens: &[usize],
         chunk_size: usize,
         steps: usize,
     ) -> (usize, Option<BlockId>) {
         restore_kv(
             self.config,
-            &mut self.state,
+            state,
             &self.prefix_cache,
             prompt_tokens,
             chunk_size,
@@ -270,7 +275,7 @@ impl Transformer {
         )
     }
 
-    pub fn forward(&mut self, token: usize, pos: usize) -> &[f32] {
+    pub fn forward<'a>(&self, s: &'a mut State, token: usize, pos: usize) -> &'a [f32] {
         let c = self.config;
         assert!(token < c.vocab && pos < c.seq_len);
         // mmap starts on a page boundary; the checkpoint is little-endian f32 data
@@ -279,7 +284,6 @@ impl Transformer {
             std::slice::from_raw_parts(self.mmap.as_ptr().cast::<f32>(), self.mmap.len() / 4)
         };
         let w = &self.weights;
-        let s = &mut self.state;
         let d = c.dim;
         let kv = c.kv_dim();
         let head_size = d / c.heads;

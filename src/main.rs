@@ -1,10 +1,12 @@
 mod cache;
 mod model;
+mod request;
 #[allow(dead_code)] // Fields reserved for the upcoming scheduler.
 mod server;
 mod tokenizer;
 
 use model::Transformer;
+use request::generate;
 use std::env;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};
@@ -76,6 +78,7 @@ impl Options {
     }
 }
 
+#[derive(Clone)]
 struct Sampler {
     temperature: f32,
     topp: f32,
@@ -145,51 +148,6 @@ impl Sampler {
     }
 }
 
-fn generate(
-    model: &mut Transformer,
-    tokenizer: &Tokenizer,
-    sampler: &mut Sampler,
-    prompt: &str,
-    steps: usize,
-    cache_chunk_size: usize,
-) -> Vec<u8> {
-    let prompt_tokens = tokenizer.encode(prompt);
-    let mut output = Vec::new();
-    let (cached_len, mut parent_id) =
-        model.restore_cached_prefix(&prompt_tokens, cache_chunk_size, steps);
-    // Each skipped forward step would have emitted the following prompt token.
-    for i in 1..=cached_len {
-        output.extend(tokenizer.decode(prompt_tokens[i - 1], prompt_tokens[i]));
-    }
-    let mut token = prompt_tokens[cached_len];
-    for pos in cached_len..steps {
-        let logits = model.forward(token, pos);
-        let next = if pos + 1 < prompt_tokens.len() {
-            prompt_tokens[pos + 1]
-        } else {
-            sampler.sample(logits)
-        };
-        if next == 1 {
-            break;
-        }
-        if cache_chunk_size > 0
-            && pos + 1 < prompt_tokens.len()
-            && (pos + 1) % cache_chunk_size == 0
-        {
-            let block_start = pos + 1 - cache_chunk_size;
-            parent_id = Some(model.cache_block(
-                parent_id,
-                &prompt_tokens[block_start..pos + 1],
-                block_start,
-            ));
-        }
-        output.extend(tokenizer.decode(token, next));
-        token = next;
-    }
-    output.push(b'\n');
-    output
-}
-
 fn read_line(label: &str) -> io::Result<String> {
     print!("{label}");
     io::stdout().flush()?;
@@ -211,6 +169,7 @@ fn chat(
     };
     let mut first = true;
     let mut pos = 0;
+    let mut state = model.new_state();
     while pos < steps {
         let user = if first {
             match &options.prompt {
@@ -236,7 +195,7 @@ fn chat(
             if pos >= steps {
                 break;
             }
-            next = sampler.sample(model.forward(token, pos));
+            next = sampler.sample(model.forward(&mut state, token, pos));
             pos += 1;
             prev = token;
             consumed += 1;
@@ -253,7 +212,7 @@ fn chat(
                 break;
             }
             prev = next;
-            next = sampler.sample(model.forward(prev, pos));
+            next = sampler.sample(model.forward(&mut state, prev, pos));
             pos += 1;
         }
         println!();

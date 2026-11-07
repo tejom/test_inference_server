@@ -1,8 +1,9 @@
 //! Synchronous HTTP request/reply plumbing for the model worker.
 
 use crate::model::Transformer;
+use crate::request::generate;
 use crate::tokenizer::Tokenizer;
-use crate::{generate, Sampler};
+use crate::Sampler;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Read;
