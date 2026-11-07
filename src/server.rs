@@ -1,6 +1,7 @@
 //! Synchronous HTTP request/reply plumbing for the model worker.
 
 use std::collections::HashMap;
+use std::error::Error;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -44,10 +45,13 @@ pub struct Server {
 
 impl Server {
     /// Starts the model and reply threads with the supplied model worker loop.
-    pub fn new<F>(http: HttpServer, model_worker: F) -> Self
+    pub fn new<F>(port: u16, model_worker: F) -> Result<Self, Box<dyn Error>>
     where
         F: FnOnce(Receiver<ModelRequest>, Sender<ModelReply>) + Send + 'static,
     {
+        let address = format!("127.0.0.1:{port}");
+        let http = HttpServer::http(&address).map_err(|e| -> Box<dyn Error> { e })?;
+        eprintln!("Listening on http://{address}");
         let pending = Arc::new(Mutex::new(HashMap::<RequestId, PendingHttpRequest>::new()));
         let (work_tx, work_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel::<ModelReply>();
@@ -68,14 +72,14 @@ impl Server {
         });
         let model_thread = thread::spawn(move || model_worker(work_rx, reply_tx));
 
-        Self {
+        Ok(Self {
             http,
             pending,
             next_id: AtomicU64::new(1),
             work_tx,
             model_thread,
             reply_thread,
-        }
+        })
     }
 
     /// Accepts HTTP requests and sends valid generation work to the model thread.

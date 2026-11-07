@@ -10,7 +10,7 @@ use std::error::Error;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tiny_http::{Header, Response, Server as HttpServer, StatusCode};
+use tiny_http::{Header, Response, StatusCode};
 use tokenizer::Tokenizer;
 
 struct Options {
@@ -299,11 +299,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         "chat" => chat(&mut model, &tokenizer, &mut sampler, &options, steps)?,
         "server" => {
-            let address = format!("127.0.0.1:{}", options.port);
-            let http = HttpServer::http(&address).map_err(|e| -> Box<dyn Error> { e })?;
-            eprintln!("Listening on http://{address}");
             let cache_chunk_size = options.cache_chunk_size;
-            let server = server::Server::new(http, move |work_rx, reply_tx| {
+            let server = server::Server::new(options.port, move |work_rx, reply_tx| {
                 for work in work_rx {
                     let body = generate(
                         &mut model,
@@ -324,7 +321,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         break;
                     }
                 }
-            });
+            })?;
             server.serve(steps);
             if server.shutdown().is_err() {
                 return Err("server worker panicked".into());
