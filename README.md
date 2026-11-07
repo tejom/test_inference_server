@@ -26,6 +26,6 @@ curl http://127.0.0.1:8080/health
 
 `POST /generate` accepts up to 8192 bytes of UTF-8 plain text and returns the full generated text, including the prompt. Sampling options are fixed when the server starts. Requests run sequentially so one model and its KV buffers can be reused safely. Prefix cache restoration is not implemented yet; each request currently starts at position zero.
 
-`Transformer` owns a `PrefixCache` with exact token-sequence keys. After each completed chunk of prompt tokens, generation copies all processed K/V positions into a `KvTensor` entry. The map currently grows without eviction. Lookup and restoration are not wired into generation yet, so cache entries do not speed up requests yet.
+`Transformer` owns a `PrefixCache` keyed by `BlockKey { parent_id, tokens }`. After each completed chunk of prompt tokens, generation copies only that chunk's K/V positions into a `KvTensor` entry. The returned block ID becomes the next chunk's parent ID, so the key includes the preceding context through the chain. The map currently grows without eviction. Restoration is not wired into generation yet, so cache entries do not speed up requests yet.
 
 The HTTP layer uses [`tiny_http`](https://docs.rs/tiny_http/) and checkpoint mapping uses [`memmap2`](https://docs.rs/memmap2/).

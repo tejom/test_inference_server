@@ -53,27 +53,78 @@ impl KvTensor {
     }
 }
 
-/// K/V tensors for a processed token prefix.
+pub type BlockId = u64;
+
+/// The parent block identifies all preceding tokens and their positions.
+#[derive(Clone, Hash, Eq, PartialEq)]
+pub struct BlockKey {
+    pub parent_id: Option<BlockId>,
+    pub tokens: Vec<usize>,
+}
+
+impl BlockKey {
+    pub fn new(parent_id: Option<BlockId>, tokens: &[usize]) -> Self {
+        Self {
+            parent_id,
+            tokens: tokens.to_vec(),
+        }
+    }
+}
+
+/// K/V tensors for one processed token block.
 #[allow(dead_code)]
-pub struct CacheEntry {
+pub struct BlockEntry {
+    pub id: BlockId,
     pub keys: KvTensor,
     pub values: KvTensor,
 }
 
-/// Exact token sequences identify reusable K/V prefixes for one model.
+/// A block is identified by its parent and its own token IDs.
 #[derive(Default)]
 #[allow(dead_code)]
 pub struct PrefixCache {
-    entries: HashMap<Vec<usize>, CacheEntry>,
+    entries: HashMap<BlockKey, BlockEntry>,
+    next_id: BlockId,
 }
 
 #[allow(dead_code)]
 impl PrefixCache {
-    pub fn get(&self, tokens: &[usize]) -> Option<&CacheEntry> {
-        self.entries.get(tokens)
+    pub fn get(&self, key: &BlockKey) -> Option<&BlockEntry> {
+        self.entries.get(key)
     }
 
-    pub fn insert(&mut self, tokens: Vec<usize>, entry: CacheEntry) -> Option<CacheEntry> {
-        self.entries.insert(tokens, entry)
+    pub fn insert(&mut self, key: BlockKey, keys: KvTensor, values: KvTensor) -> BlockId {
+        if let Some(entry) = self.entries.get(&key) {
+            return entry.id;
+        }
+        self.next_id = self
+            .next_id
+            .checked_add(1)
+            .expect("prefix cache block IDs exhausted");
+        let id = self.next_id;
+        self.entries.insert(key, BlockEntry { id, keys, values });
+        id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tensor() -> KvTensor {
+        KvTensor::new(1, 2, 1)
+    }
+
+    #[test]
+    fn block_identity_includes_parent() {
+        let mut cache = PrefixCache::default();
+        let first = cache.insert(BlockKey::new(None, &[1, 2]), tensor(), tensor());
+        let child = cache.insert(BlockKey::new(Some(first), &[3, 4]), tensor(), tensor());
+        let root = cache.insert(BlockKey::new(None, &[3, 4]), tensor(), tensor());
+        let first_again = cache.insert(BlockKey::new(None, &[1, 2]), tensor(), tensor());
+
+        assert_ne!(child, root);
+        assert_eq!(first, first_again);
+        assert_eq!(cache.entries.len(), 3);
     }
 }

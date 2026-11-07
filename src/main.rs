@@ -155,6 +155,7 @@ fn generate(
     let prompt_tokens = tokenizer.encode(prompt);
     let mut output = Vec::new();
     let mut token = prompt_tokens[0];
+    let mut parent_id = None;
     for pos in 0..steps {
         let logits = model.forward(token, pos);
         let next = if pos + 1 < prompt_tokens.len() {
@@ -169,7 +170,12 @@ fn generate(
             && pos + 1 < prompt_tokens.len()
             && (pos + 1) % cache_chunk_size == 0
         {
-            model.cache_prefix(&prompt_tokens[..pos + 1]);
+            let block_start = pos + 1 - cache_chunk_size;
+            parent_id = Some(model.cache_block(
+                parent_id,
+                &prompt_tokens[block_start..pos + 1],
+                block_start,
+            ));
         }
         output.extend(tokenizer.decode(token, next));
         token = next;

@@ -1,4 +1,4 @@
-use crate::cache::{CacheEntry, KvTensor, PrefixCache};
+use crate::cache::{BlockId, BlockKey, KvTensor, PrefixCache};
 use memmap2::Mmap;
 use std::fs::File;
 use std::io;
@@ -130,12 +130,12 @@ impl State {
     }
 }
 
-fn snapshot_kv(c: Config, state: &State, len: usize) -> CacheEntry {
+fn snapshot_kv(c: Config, state: &State, start_pos: usize, len: usize) -> (KvTensor, KvTensor) {
     let kv_dim = c.kv_dim();
     let mut keys = KvTensor::new(c.layers, len, kv_dim);
     let mut values = KvTensor::new(c.layers, len, kv_dim);
     for layer in 0..c.layers {
-        let start = layer * c.seq_len * kv_dim;
+        let start = (layer * c.seq_len + start_pos) * kv_dim;
         let end = start + len * kv_dim;
         keys.layer_mut(layer)
             .copy_from_slice(&state.keys[start..end]);
@@ -143,7 +143,7 @@ fn snapshot_kv(c: Config, state: &State, len: usize) -> CacheEntry {
             .layer_mut(layer)
             .copy_from_slice(&state.values[start..end]);
     }
-    CacheEntry { keys, values }
+    (keys, values)
 }
 
 pub struct Transformer {
@@ -195,14 +195,23 @@ impl Transformer {
         })
     }
 
-    /// Save the already processed positions in `tokens` as a full prefix snapshot.
-    pub fn cache_prefix(&mut self, tokens: &[usize]) {
-        let len = tokens.len();
-        if len == 0 || len > self.config.seq_len || self.prefix_cache.get(tokens).is_some() {
-            return;
+    /// Save one processed K/V block, returning its stable ID for the next block.
+    pub fn cache_block(
+        &mut self,
+        parent_id: Option<BlockId>,
+        tokens: &[usize],
+        start_pos: usize,
+    ) -> BlockId {
+        assert!(!tokens.is_empty());
+        assert!(start_pos
+            .checked_add(tokens.len())
+            .is_some_and(|end| end <= self.config.seq_len));
+        let key = BlockKey::new(parent_id, tokens);
+        if let Some(entry) = self.prefix_cache.get(&key) {
+            return entry.id;
         }
-        let entry = snapshot_kv(self.config, &self.state, len);
-        self.prefix_cache.insert(tokens.to_vec(), entry);
+        let (keys, values) = snapshot_kv(self.config, &self.state, start_pos, tokens.len());
+        self.prefix_cache.insert(key, keys, values)
     }
 
     pub fn forward(&mut self, token: usize, pos: usize) -> &[f32] {
@@ -371,7 +380,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshot_uses_compact_layer_stride() {
+    fn snapshot_copies_only_selected_positions_with_compact_layer_stride() {
         let c = Config {
             dim: 4,
             hidden_dim: 4,
@@ -389,10 +398,10 @@ mod tests {
             *value = 100.0 + i as f32;
         }
 
-        let snapshot = snapshot_kv(c, &state, 2);
-        assert_eq!(snapshot.keys.layer(0), &state.keys[0..8]);
-        assert_eq!(snapshot.keys.layer(1), &state.keys[16..24]);
-        assert_eq!(snapshot.values.layer(0), &state.values[0..8]);
-        assert_eq!(snapshot.values.layer(1), &state.values[16..24]);
+        let (keys, values) = snapshot_kv(c, &state, 2, 2);
+        assert_eq!(keys.layer(0), &state.keys[8..16]);
+        assert_eq!(keys.layer(1), &state.keys[24..32]);
+        assert_eq!(values.layer(0), &state.values[8..16]);
+        assert_eq!(values.layer(1), &state.values[24..32]);
     }
 }
