@@ -1,0 +1,11 @@
+[package]
+name = "llama2-rs"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+memmap2 = "0.9"
+tiny_http = "0.12"
+
+[profile.release]
+opt-level = 3
