@@ -1,5 +1,7 @@
 mod cache;
 mod model;
+#[allow(dead_code)] // The scheduled server scaffold is not connected to serve() yet.
+mod server;
 mod tokenizer;
 
 use model::Transformer;
