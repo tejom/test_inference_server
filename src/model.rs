@@ -146,6 +146,45 @@ fn snapshot_kv(c: Config, state: &State, start_pos: usize, len: usize) -> (KvTen
     (keys, values)
 }
 
+fn restore_kv(
+    c: Config,
+    state: &mut State,
+    cache: &PrefixCache,
+    prompt_tokens: &[usize],
+    chunk_size: usize,
+    steps: usize,
+) -> (usize, Option<BlockId>) {
+    if chunk_size == 0 {
+        return (0, None);
+    }
+    // Leave one prompt token and one forward step to produce the next logits.
+    let max_reusable = prompt_tokens
+        .len()
+        .saturating_sub(1)
+        .min(steps.saturating_sub(1));
+    let kv_dim = c.kv_dim();
+    let mut cached_len: usize = 0;
+    let mut parent_id = None;
+    while let Some(end) = cached_len.checked_add(chunk_size) {
+        if end > max_reusable {
+            break;
+        }
+        let key = BlockKey::new(parent_id, &prompt_tokens[cached_len..end]);
+        let Some(block) = cache.get(&key) else {
+            break;
+        };
+        for layer in 0..c.layers {
+            let start = (layer * c.seq_len + cached_len) * kv_dim;
+            let end_offset = start + chunk_size * kv_dim;
+            state.keys[start..end_offset].copy_from_slice(block.keys.layer(layer));
+            state.values[start..end_offset].copy_from_slice(block.values.layer(layer));
+        }
+        cached_len = end;
+        parent_id = Some(block.id);
+    }
+    (cached_len, parent_id)
+}
+
 pub struct Transformer {
     pub config: Config,
     mmap: Mmap,
@@ -212,6 +251,23 @@ impl Transformer {
         }
         let (keys, values) = snapshot_kv(self.config, &self.state, start_pos, tokens.len());
         self.prefix_cache.insert(key, keys, values)
+    }
+
+    /// Restore the longest chain of matching full blocks from the prompt start.
+    pub fn restore_cached_prefix(
+        &mut self,
+        prompt_tokens: &[usize],
+        chunk_size: usize,
+        steps: usize,
+    ) -> (usize, Option<BlockId>) {
+        restore_kv(
+            self.config,
+            &mut self.state,
+            &self.prefix_cache,
+            prompt_tokens,
+            chunk_size,
+            steps,
+        )
     }
 
     pub fn forward(&mut self, token: usize, pos: usize) -> &[f32] {
@@ -403,5 +459,54 @@ mod tests {
         assert_eq!(keys.layer(1), &state.keys[24..32]);
         assert_eq!(values.layer(0), &state.values[8..16]);
         assert_eq!(values.layer(1), &state.values[24..32]);
+    }
+
+    #[test]
+    fn restore_stops_at_first_missing_block_and_preserves_layer_positions() {
+        let c = Config {
+            dim: 4,
+            hidden_dim: 4,
+            layers: 2,
+            heads: 1,
+            kv_heads: 1,
+            vocab: 8,
+            seq_len: 6,
+        };
+        let mut source = State::new(c).unwrap();
+        for (i, value) in source.keys.iter_mut().enumerate() {
+            *value = i as f32;
+        }
+        for (i, value) in source.values.iter_mut().enumerate() {
+            *value = 100.0 + i as f32;
+        }
+        let mut cache = PrefixCache::default();
+        let (keys, values) = snapshot_kv(c, &source, 0, 2);
+        let first = cache.insert(BlockKey::new(None, &[1, 2]), keys, values);
+        let (keys, values) = snapshot_kv(c, &source, 2, 2);
+        let second = cache.insert(BlockKey::new(Some(first), &[3, 4]), keys, values);
+
+        let mut restored = State::new(c).unwrap();
+        assert_eq!(
+            restore_kv(c, &mut restored, &cache, &[1, 2, 3, 4, 5], 2, 5),
+            (4, Some(second))
+        );
+        for layer in 0..c.layers {
+            let base = layer * c.seq_len * c.kv_dim();
+            assert_eq!(
+                &restored.keys[base..base + 16],
+                &source.keys[base..base + 16]
+            );
+            assert_eq!(
+                &restored.values[base..base + 16],
+                &source.values[base..base + 16]
+            );
+            assert_eq!(restored.keys[base + 16], 0.0);
+        }
+
+        let mut diverged = State::new(c).unwrap();
+        assert_eq!(
+            restore_kv(c, &mut diverged, &cache, &[1, 2, 3, 9, 5], 2, 5),
+            (2, Some(first))
+        );
     }
 }

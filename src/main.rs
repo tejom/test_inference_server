@@ -154,9 +154,14 @@ fn generate(
 ) -> Vec<u8> {
     let prompt_tokens = tokenizer.encode(prompt);
     let mut output = Vec::new();
-    let mut token = prompt_tokens[0];
-    let mut parent_id = None;
-    for pos in 0..steps {
+    let (cached_len, mut parent_id) =
+        model.restore_cached_prefix(&prompt_tokens, cache_chunk_size, steps);
+    // Each skipped forward step would have emitted the following prompt token.
+    for i in 1..=cached_len {
+        output.extend(tokenizer.decode(prompt_tokens[i - 1], prompt_tokens[i]));
+    }
+    let mut token = prompt_tokens[cached_len];
+    for pos in cached_len..steps {
         let logits = model.forward(token, pos);
         let next = if pos + 1 < prompt_tokens.len() {
             prompt_tokens[pos + 1]
