@@ -1,11 +1,11 @@
 //! Synchronous HTTP request/reply plumbing for the model worker.
 
-use crate::generation::step_request;
+use crate::generation::step_batch;
 use crate::request::RequestState;
 use crate::tokenizer::Tokenizer;
 use crate::Sampler;
 use llama2_rs::model::Transformer;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::error::Error;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -85,55 +85,57 @@ fn model_worker(
     work_rx: Receiver<ModelRequest>,
     reply_tx: Sender<ModelReply>,
 ) {
-    let mut waiting = VecDeque::new();
-    let mut active: Option<(RequestId, RequestState)> = None;
+    const BATCH_SIZE: usize = 4;
+    let mut active: Vec<(RequestId, RequestState)> = Vec::new();
 
     loop {
-        if active.is_none() && waiting.is_empty() {
-            match work_rx.recv() {
-                Ok(work) => waiting.push_back(work),
-                Err(_) => break,
-            }
-        } else if let Ok(work) = work_rx.try_recv() {
-            waiting.push_back(work);
-        }
-
-        if active.is_none() {
-            if let Some(work) = waiting.pop_front() {
-                let request = RequestState::new(
+        while active.len() < BATCH_SIZE {
+            let work = if active.is_empty() {
+                match work_rx.recv() {
+                    Ok(work) => work,
+                    Err(_) => return,
+                }
+            } else {
+                let Ok(work) = work_rx.try_recv() else {
+                    break;
+                };
+                work
+            };
+            let request_sampler = sampler.clone();
+            sampler.random();
+            active.push((
+                work.id,
+                RequestState::new(
                     &model,
                     &tokenizer,
-                    sampler.clone(),
+                    request_sampler,
                     &work.prompt,
                     work.steps,
                     cache_chunk_size,
-                );
-                active = Some((work.id, request));
-            }
+                ),
+            ));
         }
 
-        if let Some((_, request)) = active.as_mut() {
-            if !request.is_done() {
-                step_request(&mut model, &tokenizer, request);
-            }
-        }
+        let mut requests: Vec<_> = active.iter_mut().map(|(_, request)| request).collect();
+        step_batch(&mut model, &tokenizer, &mut requests);
 
-        if active
-            .as_ref()
-            .is_some_and(|(_, request)| request.is_done())
-        {
-            let (id, request) = active.take().unwrap();
-            let (body, next_sampler) = request.into_result();
-            sampler = next_sampler;
-            if reply_tx
-                .send(ModelReply {
-                    id,
-                    status: 200,
-                    body,
-                })
-                .is_err()
-            {
-                break;
+        let mut i = 0;
+        while i < active.len() {
+            if active[i].1.is_done() {
+                let (id, request) = active.remove(i);
+                let (body, _) = request.into_result();
+                if reply_tx
+                    .send(ModelReply {
+                        id,
+                        status: 200,
+                        body,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            } else {
+                i += 1;
             }
         }
     }
