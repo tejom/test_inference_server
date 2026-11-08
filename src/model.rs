@@ -563,6 +563,7 @@ fn softmax(values: &mut [f32]) {
 mod tests {
     use super::*;
     use memmap2::MmapMut;
+    use std::path::Path;
 
     fn assert_close(actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len());
@@ -572,6 +573,15 @@ mod tests {
                 "index {i}: {a} != {b}"
             );
         }
+    }
+
+    fn best_token(logits: &[f32]) -> usize {
+        logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .unwrap()
+            .0
     }
 
     #[test]
@@ -630,6 +640,41 @@ mod tests {
         assert_close(&batched_second.keys, &second.keys);
         assert_close(&batched_first.values, &first.values);
         assert_close(&batched_second.values, &second.values);
+    }
+
+    #[test]
+    #[ignore = "set LLAMA2_BENCH_MODEL to a checkpoint path"]
+    fn real_checkpoint_batch_matches_separate_forwards() {
+        let path = std::env::var("LLAMA2_BENCH_MODEL").expect("set LLAMA2_BENCH_MODEL");
+        let model = Transformer::load(Path::new(&path)).unwrap();
+        for batch_size in [2, 4, 8] {
+            let mut separate: Vec<_> = (0..batch_size).map(|_| model.new_state()).collect();
+            let mut batched: Vec<_> = (0..batch_size).map(|_| model.new_state()).collect();
+            for pos in 0..8.min(model.config.seq_len) {
+                for (i, state) in separate.iter_mut().enumerate() {
+                    model.forward(state, (i * 7 + pos) % model.config.vocab, pos);
+                }
+                let mut items: Vec<_> = batched
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, state)| ForwardItem {
+                        state,
+                        token: (i * 7 + pos) % model.config.vocab,
+                        pos,
+                    })
+                    .collect();
+                model.forward_batch(&mut items);
+                drop(items);
+                for (a, b) in batched.iter().zip(&separate) {
+                    assert_close(a.logits(), b.logits());
+                    assert_eq!(best_token(a.logits()), best_token(b.logits()));
+                }
+            }
+            for (a, b) in batched.iter().zip(&separate) {
+                assert_close(&a.keys, &b.keys);
+                assert_close(&a.values, &b.values);
+            }
+        }
     }
 
     #[test]
