@@ -24,8 +24,24 @@ curl --data-binary 'Once upon a time' -H 'Content-Type: text/plain' http://127.0
 curl http://127.0.0.1:8080/health
 ```
 
-`POST /generate` accepts up to 8192 bytes of UTF-8 plain text and returns the full generated text, including the prompt. Sampling options are fixed when the server starts. The HTTP listener queues requests while one model worker processes them sequentially; a separate reply worker sends completed responses. Each request owns its model state and advances one token per step, though the worker still runs it to completion before starting the next request. Batching is not implemented yet.
+`POST /generate` accepts up to 8192 bytes of UTF-8 plain text and returns the full generated text, including the prompt. Sampling options are fixed when the server starts. The model worker receives requests into a FIFO waiting queue and keeps one active request. It advances that request one token per turn, then sends the completed result to a separate reply worker. The model can run a batched forward pass, but the server does not yet put multiple requests into one batch.
 
 `Transformer` owns a `PrefixCache` keyed by `BlockKey { parent_id, tokens }`. After each completed chunk of prompt tokens, generation copies only that chunk's K/V positions into a `KvTensor` entry. The returned block ID becomes the next chunk's parent ID, so the key includes the preceding context through the chain. Before generation, matching blocks are restored in order and the forward loop resumes at the first uncached token. At least one prompt token is processed normally to produce logits. The map currently grows without eviction.
 
 The HTTP layer uses [`tiny_http`](https://docs.rs/tiny_http/) and checkpoint mapping uses [`memmap2`](https://docs.rs/memmap2/).
+
+## Forward benchmark
+
+Compare four separate forwards with one forward batch of four, over eight positions. The binary prints median time, tokens per second, and speedup across three runs:
+
+```sh
+cargo run --release --bin bench_forward -- ../stories15M.bin 4 8 3
+```
+
+The same comparison is available as an ignored test:
+
+```sh
+LLAMA2_BENCH_MODEL=../stories15M.bin cargo test --release bench_forward -- --ignored --nocapture
+```
+
+This measures model forward time only. The server still processes one active request at a time.

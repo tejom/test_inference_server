@@ -1,13 +1,11 @@
-mod cache;
 mod generation;
-mod model;
 mod request;
 #[allow(dead_code)] // Fields reserved for the upcoming scheduler.
 mod server;
 mod tokenizer;
 
 use generation::generate;
-use model::Transformer;
+use llama2_rs::model::Transformer;
 use std::env;
 use std::error::Error;
 use std::io::{self, IsTerminal, Write};

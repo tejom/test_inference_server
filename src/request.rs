@@ -1,7 +1,7 @@
-use crate::cache::BlockId;
-use crate::model::{State, Transformer};
 use crate::tokenizer::Tokenizer;
 use crate::Sampler;
+use llama2_rs::cache::BlockId;
+use llama2_rs::model::{State, Transformer};
 
 /// Everything needed to resume one generation request at its next token.
 pub struct RequestState {
@@ -30,6 +30,10 @@ impl RequestState {
         let mut model_state = model.new_state();
         let (cached_len, parent_id) =
             model.restore_cached_prefix(&mut model_state, &prompt_tokens, cache_chunk_size, steps);
+        eprintln!(
+            "prefix cache: {cached_len}/{} prompt tokens reused",
+            prompt_tokens.len()
+        );
         let mut output = Vec::new();
         for i in 1..=cached_len {
             output.extend(tokenizer.decode(prompt_tokens[i - 1], prompt_tokens[i]));

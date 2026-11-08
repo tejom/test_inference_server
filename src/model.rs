@@ -128,6 +128,17 @@ impl State {
             values: vec![0.0; kv_size],
         })
     }
+
+    pub fn logits(&self) -> &[f32] {
+        &self.logits
+    }
+}
+
+/// One request's input to a forward pass.
+pub struct ForwardItem<'a> {
+    pub state: &'a mut State,
+    pub token: usize,
+    pub pos: usize,
 }
 
 fn snapshot_kv(c: Config, state: &State, start_pos: usize, len: usize) -> (KvTensor, KvTensor) {
@@ -276,111 +287,120 @@ impl Transformer {
     }
 
     pub fn forward<'a>(&self, s: &'a mut State, token: usize, pos: usize) -> &'a [f32] {
+        self.forward_batch(&mut [ForwardItem {
+            state: s,
+            token,
+            pos,
+        }]);
+        &s.logits
+    }
+
+    /// Advances every item through the same model layers, sharing each weight row.
+    pub fn forward_batch(&self, batch: &mut [ForwardItem<'_>]) {
         let c = self.config;
-        assert!(token < c.vocab && pos < c.seq_len);
-        // mmap starts on a page boundary; the checkpoint is little-endian f32 data
-        // after its seven-i32 header. It remains read-only for this model's lifetime.
+        let d = c.dim;
+        let kv = c.kv_dim();
+        for item in batch.iter_mut() {
+            assert!(item.token < c.vocab && item.pos < c.seq_len);
+        }
+        // The mapped checkpoint contains aligned little-endian f32 weights.
         let f = unsafe {
             std::slice::from_raw_parts(self.mmap.as_ptr().cast::<f32>(), self.mmap.len() / 4)
         };
         let w = &self.weights;
-        let d = c.dim;
-        let kv = c.kv_dim();
-        let head_size = d / c.heads;
-        s.x.copy_from_slice(&f[w.embedding.start + token * d..w.embedding.start + (token + 1) * d]);
+        for item in batch.iter_mut() {
+            item.state.x.copy_from_slice(
+                &f[w.embedding.start + item.token * d..w.embedding.start + (item.token + 1) * d],
+            );
+        }
+
         for layer in 0..c.layers {
-            rmsnorm(&mut s.xb, &s.x, &f[w.rms_att.start + layer * d..][..d]);
-            let base = (layer * c.seq_len + pos) * kv;
-            matmul(
-                &mut s.q,
-                &s.xb,
+            for item in batch.iter_mut() {
+                rmsnorm(
+                    &mut item.state.xb,
+                    &item.state.x,
+                    &f[w.rms_att.start + layer * d..][..d],
+                );
+            }
+            matmul_batch(
+                batch,
                 &f[w.wq.start + layer * d * d..][..d * d],
                 d,
+                |item| (&item.state.xb, &mut item.state.q),
             );
-            matmul(
-                &mut s.keys[base..base + kv],
-                &s.xb,
+            matmul_batch(
+                batch,
                 &f[w.wk.start + layer * d * kv..][..d * kv],
                 d,
+                |item| {
+                    let base = (layer * c.seq_len + item.pos) * kv;
+                    (&item.state.xb, &mut item.state.keys[base..base + kv])
+                },
             );
-            matmul(
-                &mut s.values[base..base + kv],
-                &s.xb,
+            matmul_batch(
+                batch,
                 &f[w.wv.start + layer * d * kv..][..d * kv],
                 d,
+                |item| {
+                    let base = (layer * c.seq_len + item.pos) * kv;
+                    (&item.state.xb, &mut item.state.values[base..base + kv])
+                },
             );
-            for i in (0..d).step_by(2) {
-                let frequency = 1.0 / 10000.0_f32.powf((i % head_size) as f32 / head_size as f32);
-                let angle = pos as f32 * frequency;
-                let (sin, cos) = angle.sin_cos();
-                rotate(&mut s.q[i..i + 2], cos, sin);
-                if i < kv {
-                    rotate(&mut s.keys[base + i..base + i + 2], cos, sin);
-                }
+            for item in batch.iter_mut() {
+                attention(item.state, c, layer, item.pos);
             }
-            for h in 0..c.heads {
-                let q = &s.q[h * head_size..(h + 1) * head_size];
-                let att = &mut s.att[h * c.seq_len..h * c.seq_len + pos + 1];
-                let kv_head = h / (c.heads / c.kv_heads);
-                for (t, score) in att.iter_mut().enumerate() {
-                    let offset = (layer * c.seq_len + t) * kv + kv_head * head_size;
-                    let key = &s.keys[offset..offset + head_size];
-                    let mut dot = 0.0;
-                    for i in 0..head_size {
-                        dot += q[i] * key[i];
-                    }
-                    *score = dot / (head_size as f32).sqrt();
-                }
-                softmax(att);
-                let xb = &mut s.xb[h * head_size..(h + 1) * head_size];
-                xb.fill(0.0);
-                for (t, &a) in att.iter().enumerate() {
-                    let offset = (layer * c.seq_len + t) * kv + kv_head * head_size;
-                    let value = &s.values[offset..offset + head_size];
-                    for i in 0..head_size {
-                        xb[i] += a * value[i];
-                    }
-                }
-            }
-            matmul(
-                &mut s.xb2,
-                &s.xb,
+            matmul_batch(
+                batch,
                 &f[w.wo.start + layer * d * d..][..d * d],
                 d,
+                |item| (&item.state.xb, &mut item.state.xb2),
             );
-            for i in 0..d {
-                s.x[i] += s.xb2[i];
+            for item in batch.iter_mut() {
+                for i in 0..d {
+                    item.state.x[i] += item.state.xb2[i];
+                }
+                rmsnorm(
+                    &mut item.state.xb,
+                    &item.state.x,
+                    &f[w.rms_ffn.start + layer * d..][..d],
+                );
             }
-            rmsnorm(&mut s.xb, &s.x, &f[w.rms_ffn.start + layer * d..][..d]);
-            matmul(
-                &mut s.hb,
-                &s.xb,
+            matmul_batch(
+                batch,
                 &f[w.w1.start + layer * d * c.hidden_dim..][..d * c.hidden_dim],
                 d,
+                |item| (&item.state.xb, &mut item.state.hb),
             );
-            matmul(
-                &mut s.hb2,
-                &s.xb,
+            matmul_batch(
+                batch,
                 &f[w.w3.start + layer * d * c.hidden_dim..][..d * c.hidden_dim],
                 d,
+                |item| (&item.state.xb, &mut item.state.hb2),
             );
-            for i in 0..c.hidden_dim {
-                let value = s.hb[i];
-                s.hb[i] = value / (1.0 + (-value).exp()) * s.hb2[i];
+            for item in batch.iter_mut() {
+                for i in 0..c.hidden_dim {
+                    let value = item.state.hb[i];
+                    item.state.hb[i] = value / (1.0 + (-value).exp()) * item.state.hb2[i];
+                }
             }
-            matmul(
-                &mut s.xb,
-                &s.hb,
+            matmul_batch(
+                batch,
                 &f[w.w2.start + layer * d * c.hidden_dim..][..d * c.hidden_dim],
                 c.hidden_dim,
+                |item| (&item.state.hb, &mut item.state.xb),
             );
-            for i in 0..d {
-                s.x[i] += s.xb[i];
+            for item in batch.iter_mut() {
+                for i in 0..d {
+                    item.state.x[i] += item.state.xb[i];
+                }
             }
         }
-        rmsnorm_inplace(&mut s.x, &f[w.rms_final.clone()]);
-        matmul(&mut s.logits, &s.x, &f[w.classifier.clone()], d);
-        &s.logits
+        for item in batch.iter_mut() {
+            rmsnorm_inplace(&mut item.state.x, &f[w.rms_final.clone()]);
+        }
+        matmul_batch(batch, &f[w.classifier.clone()], d, |item| {
+            (&item.state.x, &mut item.state.logits)
+        });
     }
 }
 
@@ -391,6 +411,71 @@ fn matmul(out: &mut [f32], x: &[f32], weights: &[f32], width: usize) {
             sum += row[i] * x[i];
         }
         *result = sum;
+    }
+}
+
+fn attention(s: &mut State, c: Config, layer: usize, pos: usize) {
+    let d = c.dim;
+    let kv = c.kv_dim();
+    let head_size = d / c.heads;
+    let base = (layer * c.seq_len + pos) * kv;
+    for i in (0..d).step_by(2) {
+        let frequency = 1.0 / 10000.0_f32.powf((i % head_size) as f32 / head_size as f32);
+        let angle = pos as f32 * frequency;
+        let (sin, cos) = angle.sin_cos();
+        rotate(&mut s.q[i..i + 2], cos, sin);
+        if i < kv {
+            rotate(&mut s.keys[base + i..base + i + 2], cos, sin);
+        }
+    }
+    for h in 0..c.heads {
+        let q = &s.q[h * head_size..(h + 1) * head_size];
+        let att = &mut s.att[h * c.seq_len..h * c.seq_len + pos + 1];
+        let kv_head = h / (c.heads / c.kv_heads);
+        for (t, score) in att.iter_mut().enumerate() {
+            let offset = (layer * c.seq_len + t) * kv + kv_head * head_size;
+            let key = &s.keys[offset..offset + head_size];
+            let mut dot = 0.0;
+            for i in 0..head_size {
+                dot += q[i] * key[i];
+            }
+            *score = dot / (head_size as f32).sqrt();
+        }
+        softmax(att);
+        let xb = &mut s.xb[h * head_size..(h + 1) * head_size];
+        xb.fill(0.0);
+        for (t, &a) in att.iter().enumerate() {
+            let offset = (layer * c.seq_len + t) * kv + kv_head * head_size;
+            let value = &s.values[offset..offset + head_size];
+            for i in 0..head_size {
+                xb[i] += a * value[i];
+            }
+        }
+    }
+}
+
+fn matmul_batch<'state, F>(
+    batch: &mut [ForwardItem<'state>],
+    weights: &[f32],
+    width: usize,
+    mut buffers: F,
+) where
+    F: for<'a> FnMut(&'a mut ForwardItem<'state>) -> (&'a [f32], &'a mut [f32]),
+{
+    if let [item] = batch {
+        let (x, out) = buffers(item);
+        matmul(out, x, weights, width);
+        return;
+    }
+    for (output, row) in weights.chunks_exact(width).enumerate() {
+        for item in batch.iter_mut() {
+            let (x, out) = buffers(item);
+            let mut sum = 0.0;
+            for i in 0..width {
+                sum += row[i] * x[i];
+            }
+            out[output] = sum;
+        }
     }
 }
 
@@ -438,6 +523,107 @@ fn softmax(values: &mut [f32]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memmap2::MmapMut;
+
+    #[test]
+    fn batched_forward_matches_two_separate_requests() {
+        let c = Config {
+            dim: 4,
+            hidden_dim: 8,
+            layers: 2,
+            heads: 2,
+            kv_heads: 1,
+            vocab: 8,
+            seq_len: 4,
+        };
+        let weights = Weights::new(c, false, usize::MAX).unwrap();
+        let mut mmap = MmapMut::map_anon(weights.classifier.end * 4).unwrap();
+        for i in 7..weights.classifier.end {
+            let value = ((i * 7 % 23) as f32 - 11.0) / 30.0;
+            mmap[i * 4..(i + 1) * 4].copy_from_slice(&value.to_le_bytes());
+        }
+        let model = Transformer {
+            config: c,
+            mmap: mmap.make_read_only().unwrap(),
+            weights,
+            prefix_cache: PrefixCache::default(),
+        };
+        let mut first = model.new_state();
+        let mut second = model.new_state();
+        model.forward(&mut first, 1, 0);
+        model.forward(&mut second, 3, 0);
+        model.forward(&mut second, 4, 1);
+        let mut batched_first = model.new_state();
+        let mut batched_second = model.new_state();
+        model.forward(&mut batched_first, 1, 0);
+        model.forward(&mut batched_second, 3, 0);
+        model.forward(&mut batched_second, 4, 1);
+
+        model.forward(&mut first, 2, 1);
+        model.forward(&mut second, 5, 2);
+        model.forward_batch(&mut [
+            ForwardItem {
+                state: &mut batched_first,
+                token: 2,
+                pos: 1,
+            },
+            ForwardItem {
+                state: &mut batched_second,
+                token: 5,
+                pos: 2,
+            },
+        ]);
+        assert_eq!(batched_first.x, first.x);
+        assert_eq!(batched_second.x, second.x);
+        assert_eq!(batched_first.logits, first.logits);
+        assert_eq!(batched_second.logits, second.logits);
+        assert_eq!(batched_first.keys, first.keys);
+        assert_eq!(batched_second.keys, second.keys);
+        assert_eq!(batched_first.values, first.values);
+        assert_eq!(batched_second.values, second.values);
+    }
+
+    #[test]
+    fn batched_classifier_matches_separate_matmuls() {
+        let c = Config {
+            dim: 4,
+            hidden_dim: 4,
+            layers: 1,
+            heads: 1,
+            kv_heads: 1,
+            vocab: 3,
+            seq_len: 2,
+        };
+        let mut first = State::new(c).unwrap();
+        let mut second = State::new(c).unwrap();
+        first.x.copy_from_slice(&[1.0, 2.0, 3.0, 4.0]);
+        second.x.copy_from_slice(&[4.0, 3.0, 2.0, 1.0]);
+        let weights = [1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0, -1.0, 1.0, -1.0, 1.0];
+        let mut expected_first = [0.0; 3];
+        let mut expected_second = [0.0; 3];
+        matmul(&mut expected_first, &first.x, &weights, c.dim);
+        matmul(&mut expected_second, &second.x, &weights, c.dim);
+
+        matmul_batch(
+            &mut [
+                ForwardItem {
+                    state: &mut first,
+                    token: 0,
+                    pos: 0,
+                },
+                ForwardItem {
+                    state: &mut second,
+                    token: 0,
+                    pos: 0,
+                },
+            ],
+            &weights,
+            c.dim,
+            |item| (&item.state.x, &mut item.state.logits),
+        );
+        assert_eq!(first.logits, expected_first);
+        assert_eq!(second.logits, expected_second);
+    }
 
     #[test]
     fn snapshot_copies_only_selected_positions_with_compact_layer_stride() {

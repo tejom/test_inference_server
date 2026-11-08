@@ -1,11 +1,11 @@
 //! Synchronous HTTP request/reply plumbing for the model worker.
 
 use crate::generation::step_request;
-use crate::model::Transformer;
 use crate::request::RequestState;
 use crate::tokenizer::Tokenizer;
 use crate::Sampler;
-use std::collections::HashMap;
+use llama2_rs::model::Transformer;
+use std::collections::{HashMap, VecDeque};
 use std::error::Error;
 use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -61,12 +61,18 @@ fn reply_worker(
     for reply in reply_rx {
         let pending_request = pending.lock().unwrap().remove(&reply.id);
         if let Some(pending_request) = pending_request {
+            let received_at = pending_request.received_at;
             if let Err(error) = pending_request
                 .request
                 .respond(response(reply.body, reply.status))
             {
                 eprintln!("response error: {error}");
             }
+            eprintln!(
+                "request {}: {} ms",
+                reply.id,
+                received_at.elapsed().as_millis()
+            );
         }
     }
 }
@@ -79,29 +85,56 @@ fn model_worker(
     work_rx: Receiver<ModelRequest>,
     reply_tx: Sender<ModelReply>,
 ) {
-    for work in work_rx {
-        let mut request = RequestState::new(
-            &model,
-            &tokenizer,
-            sampler.clone(),
-            &work.prompt,
-            work.steps,
-            cache_chunk_size,
-        );
-        while !request.is_done() {
-            step_request(&mut model, &tokenizer, &mut request);
+    let mut waiting = VecDeque::new();
+    let mut active: Option<(RequestId, RequestState)> = None;
+
+    loop {
+        if active.is_none() && waiting.is_empty() {
+            match work_rx.recv() {
+                Ok(work) => waiting.push_back(work),
+                Err(_) => break,
+            }
+        } else if let Ok(work) = work_rx.try_recv() {
+            waiting.push_back(work);
         }
-        let (body, next_sampler) = request.into_result();
-        sampler = next_sampler;
-        if reply_tx
-            .send(ModelReply {
-                id: work.id,
-                status: 200,
-                body,
-            })
-            .is_err()
+
+        if active.is_none() {
+            if let Some(work) = waiting.pop_front() {
+                let request = RequestState::new(
+                    &model,
+                    &tokenizer,
+                    sampler.clone(),
+                    &work.prompt,
+                    work.steps,
+                    cache_chunk_size,
+                );
+                active = Some((work.id, request));
+            }
+        }
+
+        if let Some((_, request)) = active.as_mut() {
+            if !request.is_done() {
+                step_request(&mut model, &tokenizer, request);
+            }
+        }
+
+        if active
+            .as_ref()
+            .is_some_and(|(_, request)| request.is_done())
         {
-            break;
+            let (id, request) = active.take().unwrap();
+            let (body, next_sampler) = request.into_result();
+            sampler = next_sampler;
+            if reply_tx
+                .send(ModelReply {
+                    id,
+                    status: 200,
+                    body,
+                })
+                .is_err()
+            {
+                break;
+            }
         }
     }
 }

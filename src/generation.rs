@@ -1,7 +1,7 @@
-use crate::model::Transformer;
 use crate::request::RequestState;
 use crate::tokenizer::Tokenizer;
 use crate::Sampler;
+use llama2_rs::model::{ForwardItem, Transformer};
 
 /// Advances one request by one prompt or decode token.
 pub fn step_request(model: &mut Transformer, tokenizer: &Tokenizer, request: &mut RequestState) {
@@ -10,7 +10,12 @@ pub fn step_request(model: &mut Transformer, tokenizer: &Tokenizer, request: &mu
     }
     let pos = request.pos;
     let token = request.token;
-    let logits = model.forward(&mut request.model_state, token, pos);
+    model.forward_batch(&mut [ForwardItem {
+        state: &mut request.model_state,
+        token,
+        pos,
+    }]);
+    let logits = request.model_state.logits();
     let next = if pos + 1 < request.prompt_tokens.len() {
         request.prompt_tokens[pos + 1]
     } else {
