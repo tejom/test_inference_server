@@ -1,6 +1,6 @@
 # Matrix multiplication experiment
 
-Branch: `experiment/matrixmultiply`. The scalar baseline is commit `3c86e22`.
+Merged into `main` from `experiment/matrixmultiply`. The scalar baseline is commit `3c86e22`.
 
 For batches of two or more, each projection packs the request vectors into a
 `batch × width` matrix, calls `matrixmultiply::sgemm`, then copies the output
@@ -22,8 +22,8 @@ cargo run --release --bin bench_forward -- ../stories15M.bin 4 16 5
 cargo run --release --bin bench_forward -- ../stories15M.bin 8 16 5
 ```
 
-These numbers measure model forward work only. The server still has one active
-request, so it does not yet call the model with a multi-request batch.
+These numbers measure model forward work only. The server now batches up to four
+active requests.
 
 The real-checkpoint correctness test compares batches of 2, 4, and 8 against
 separate forwards over eight positions. It checks logits, chosen top tokens,
