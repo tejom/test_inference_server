@@ -1,4 +1,5 @@
 use crate::cache::{BlockId, BlockKey, KvTensor, PrefixCache};
+use matrixmultiply::sgemm;
 use memmap2::Mmap;
 use std::fs::File;
 use std::io;
@@ -139,6 +140,12 @@ pub struct ForwardItem<'a> {
     pub state: &'a mut State,
     pub token: usize,
     pub pos: usize,
+}
+
+#[derive(Default)]
+struct MatmulScratch {
+    input: Vec<f32>,
+    output: Vec<f32>,
 }
 
 fn snapshot_kv(c: Config, state: &State, start_pos: usize, len: usize) -> (KvTensor, KvTensor) {
@@ -297,6 +304,9 @@ impl Transformer {
 
     /// Advances every item through the same model layers, sharing each weight row.
     pub fn forward_batch(&self, batch: &mut [ForwardItem<'_>]) {
+        if batch.is_empty() {
+            return;
+        }
         let c = self.config;
         let d = c.dim;
         let kv = c.kv_dim();
@@ -308,6 +318,7 @@ impl Transformer {
             std::slice::from_raw_parts(self.mmap.as_ptr().cast::<f32>(), self.mmap.len() / 4)
         };
         let w = &self.weights;
+        let mut scratch = MatmulScratch::default();
         for item in batch.iter_mut() {
             item.state.x.copy_from_slice(
                 &f[w.embedding.start + item.token * d..w.embedding.start + (item.token + 1) * d],
@@ -326,12 +337,14 @@ impl Transformer {
                 batch,
                 &f[w.wq.start + layer * d * d..][..d * d],
                 d,
+                &mut scratch,
                 |item| (&item.state.xb, &mut item.state.q),
             );
             matmul_batch(
                 batch,
                 &f[w.wk.start + layer * d * kv..][..d * kv],
                 d,
+                &mut scratch,
                 |item| {
                     let base = (layer * c.seq_len + item.pos) * kv;
                     (&item.state.xb, &mut item.state.keys[base..base + kv])
@@ -341,6 +354,7 @@ impl Transformer {
                 batch,
                 &f[w.wv.start + layer * d * kv..][..d * kv],
                 d,
+                &mut scratch,
                 |item| {
                     let base = (layer * c.seq_len + item.pos) * kv;
                     (&item.state.xb, &mut item.state.values[base..base + kv])
@@ -353,6 +367,7 @@ impl Transformer {
                 batch,
                 &f[w.wo.start + layer * d * d..][..d * d],
                 d,
+                &mut scratch,
                 |item| (&item.state.xb, &mut item.state.xb2),
             );
             for item in batch.iter_mut() {
@@ -369,12 +384,14 @@ impl Transformer {
                 batch,
                 &f[w.w1.start + layer * d * c.hidden_dim..][..d * c.hidden_dim],
                 d,
+                &mut scratch,
                 |item| (&item.state.xb, &mut item.state.hb),
             );
             matmul_batch(
                 batch,
                 &f[w.w3.start + layer * d * c.hidden_dim..][..d * c.hidden_dim],
                 d,
+                &mut scratch,
                 |item| (&item.state.xb, &mut item.state.hb2),
             );
             for item in batch.iter_mut() {
@@ -387,6 +404,7 @@ impl Transformer {
                 batch,
                 &f[w.w2.start + layer * d * c.hidden_dim..][..d * c.hidden_dim],
                 c.hidden_dim,
+                &mut scratch,
                 |item| (&item.state.hb, &mut item.state.xb),
             );
             for item in batch.iter_mut() {
@@ -398,7 +416,7 @@ impl Transformer {
         for item in batch.iter_mut() {
             rmsnorm_inplace(&mut item.state.x, &f[w.rms_final.clone()]);
         }
-        matmul_batch(batch, &f[w.classifier.clone()], d, |item| {
+        matmul_batch(batch, &f[w.classifier.clone()], d, &mut scratch, |item| {
             (&item.state.x, &mut item.state.logits)
         });
     }
@@ -458,6 +476,7 @@ fn matmul_batch<'state, F>(
     batch: &mut [ForwardItem<'state>],
     weights: &[f32],
     width: usize,
+    scratch: &mut MatmulScratch,
     mut buffers: F,
 ) where
     F: for<'a> FnMut(&'a mut ForwardItem<'state>) -> (&'a [f32], &'a mut [f32]),
@@ -467,15 +486,35 @@ fn matmul_batch<'state, F>(
         matmul(out, x, weights, width);
         return;
     }
-    for (output, row) in weights.chunks_exact(width).enumerate() {
-        for item in batch.iter_mut() {
-            let (x, out) = buffers(item);
-            let mut sum = 0.0;
-            for i in 0..width {
-                sum += row[i] * x[i];
-            }
-            out[output] = sum;
-        }
+    let rows = weights.len() / width;
+    scratch.input.clear();
+    for item in batch.iter_mut() {
+        let (x, _) = buffers(item);
+        scratch.input.extend_from_slice(x);
+    }
+    scratch.output.resize(batch.len() * rows, 0.0);
+    // X is batch × width; the checkpoint weights are rows × width, viewed as transposed.
+    unsafe {
+        sgemm(
+            batch.len(),
+            width,
+            rows,
+            1.0,
+            scratch.input.as_ptr(),
+            width as isize,
+            1,
+            weights.as_ptr(),
+            1,
+            width as isize,
+            0.0,
+            scratch.output.as_mut_ptr(),
+            rows as isize,
+            1,
+        );
+    }
+    for (i, item) in batch.iter_mut().enumerate() {
+        let (_, out) = buffers(item);
+        out.copy_from_slice(&scratch.output[i * rows..(i + 1) * rows]);
     }
 }
 
@@ -525,6 +564,16 @@ mod tests {
     use super::*;
     use memmap2::MmapMut;
 
+    fn assert_close(actual: &[f32], expected: &[f32]) {
+        assert_eq!(actual.len(), expected.len());
+        for (i, (&a, &b)) in actual.iter().zip(expected).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-4 * b.abs().max(1.0),
+                "index {i}: {a} != {b}"
+            );
+        }
+    }
+
     #[test]
     fn batched_forward_matches_two_separate_requests() {
         let c = Config {
@@ -573,14 +622,14 @@ mod tests {
                 pos: 2,
             },
         ]);
-        assert_eq!(batched_first.x, first.x);
-        assert_eq!(batched_second.x, second.x);
-        assert_eq!(batched_first.logits, first.logits);
-        assert_eq!(batched_second.logits, second.logits);
-        assert_eq!(batched_first.keys, first.keys);
-        assert_eq!(batched_second.keys, second.keys);
-        assert_eq!(batched_first.values, first.values);
-        assert_eq!(batched_second.values, second.values);
+        assert_close(&batched_first.x, &first.x);
+        assert_close(&batched_second.x, &second.x);
+        assert_close(&batched_first.logits, &first.logits);
+        assert_close(&batched_second.logits, &second.logits);
+        assert_close(&batched_first.keys, &first.keys);
+        assert_close(&batched_second.keys, &second.keys);
+        assert_close(&batched_first.values, &first.values);
+        assert_close(&batched_second.values, &second.values);
     }
 
     #[test]
@@ -619,6 +668,7 @@ mod tests {
             ],
             &weights,
             c.dim,
+            &mut MatmulScratch::default(),
             |item| (&item.state.x, &mut item.state.logits),
         );
         assert_eq!(first.logits, expected_first);

@@ -5,6 +5,7 @@ edition = "2021"
 default-run = "llama2-rs"
 
 [dependencies]
+matrixmultiply = "0.3.11"
 memmap2 = "0.9"
 tiny_http = "0.12"
 
