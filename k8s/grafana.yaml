@@ -1,0 +1,121 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: llama2-grafana-config
+data:
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Prometheus
+        uid: prometheus
+        type: prometheus
+        access: proxy
+        url: http://llama2-prometheus:9090
+        isDefault: true
+        editable: false
+  dashboards.yaml: |
+    apiVersion: 1
+    providers:
+      - name: llama2
+        orgId: 1
+        folder: Llama2
+        type: file
+        options:
+          path: /var/lib/grafana/dashboards
+  workers.json: |
+    {
+      "uid": "llama2-workers",
+      "title": "Llama2 Workers",
+      "schemaVersion": 41,
+      "version": 1,
+      "refresh": "5s",
+      "time": {"from": "now-15m", "to": "now"},
+      "panels": [
+        {
+          "id": 1,
+          "title": "Requests per second",
+          "type": "timeseries",
+          "gridPos": {"x": 0, "y": 0, "w": 12, "h": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"refId": "A", "expr": "rate(llama2_requests_total[1m])", "legendFormat": "{{instance}}"}],
+          "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []}
+        },
+        {
+          "id": 2,
+          "title": "Prefix tokens reused (1m %)",
+          "type": "timeseries",
+          "gridPos": {"x": 12, "y": 0, "w": 12, "h": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"refId": "A", "expr": "100 * increase(llama2_prefix_reused_tokens_total[1m]) / increase(llama2_prompt_tokens_total[1m])", "legendFormat": "{{instance}}"}],
+          "fieldConfig": {"defaults": {"unit": "percent", "min": 0, "max": 100}, "overrides": []}
+        },
+        {
+          "id": 3,
+          "title": "Average batch size (1m)",
+          "type": "timeseries",
+          "gridPos": {"x": 0, "y": 8, "w": 12, "h": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"refId": "A", "expr": "increase(llama2_batch_items_total[1m]) / increase(llama2_batch_steps_total[1m])", "legendFormat": "{{instance}}"}],
+          "fieldConfig": {"defaults": {"unit": "short", "min": 0}, "overrides": []}
+        },
+        {
+          "id": 4,
+          "title": "Average request time (1m)",
+          "type": "timeseries",
+          "gridPos": {"x": 12, "y": 8, "w": 12, "h": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"refId": "A", "expr": "increase(llama2_request_duration_seconds_sum[1m]) / increase(llama2_request_duration_seconds_count[1m])", "legendFormat": "{{instance}}"}],
+          "fieldConfig": {"defaults": {"unit": "s", "min": 0}, "overrides": []}
+        },
+        {
+          "id": 5,
+          "title": "Completed requests (since worker restart)",
+          "type": "stat",
+          "gridPos": {"x": 0, "y": 16, "w": 12, "h": 8},
+          "datasource": {"type": "prometheus", "uid": "prometheus"},
+          "targets": [{"refId": "A", "expr": "llama2_requests_total", "legendFormat": "{{instance}}"}],
+          "fieldConfig": {"defaults": {"unit": "short", "decimals": 0}, "overrides": []},
+          "options": {"reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}}
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llama2-grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llama2-grafana
+  template:
+    metadata:
+      labels:
+        app: llama2-grafana
+    spec:
+      containers:
+        - name: grafana
+          image: grafana/grafana:13.3.0
+          ports:
+            - containerPort: 3000
+              name: http
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: http
+            periodSeconds: 5
+          volumeMounts:
+            - name: config
+              mountPath: /etc/grafana/provisioning/datasources/llama2.yaml
+              subPath: datasource.yaml
+            - name: config
+              mountPath: /etc/grafana/provisioning/dashboards/llama2.yaml
+              subPath: dashboards.yaml
+            - name: config
+              mountPath: /var/lib/grafana/dashboards/workers.json
+              subPath: workers.json
+      volumes:
+        - name: config
+          configMap:
+            name: llama2-grafana-config

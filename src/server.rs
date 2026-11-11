@@ -1,6 +1,7 @@
 //! Synchronous HTTP request/reply plumbing for the model worker.
 
 use crate::generation::step_batch;
+use crate::metrics::Metrics;
 use crate::request::RequestState;
 use crate::tokenizer::Tokenizer;
 use crate::Sampler;
@@ -42,6 +43,7 @@ pub struct ModelReply {
 pub struct Server {
     pub http: HttpServer,
     pending: Arc<Mutex<HashMap<RequestId, PendingHttpRequest>>>,
+    metrics: Arc<Metrics>,
     next_id: AtomicU64,
     work_tx: Sender<ModelRequest>,
     model_thread: JoinHandle<()>,
@@ -84,9 +86,10 @@ fn model_worker(
     cache_chunk_size: usize,
     work_rx: Receiver<ModelRequest>,
     reply_tx: Sender<ModelReply>,
+    metrics: Arc<Metrics>,
 ) {
     const BATCH_SIZE: usize = 4;
-    let mut active: Vec<(RequestId, RequestState)> = Vec::new();
+    let mut active: Vec<(RequestId, RequestState, Instant)> = Vec::new();
 
     loop {
         while active.len() < BATCH_SIZE {
@@ -103,26 +106,27 @@ fn model_worker(
             };
             let request_sampler = sampler.clone();
             sampler.random();
-            active.push((
-                work.id,
-                RequestState::new(
-                    &model,
-                    &tokenizer,
-                    request_sampler,
-                    &work.prompt,
-                    work.steps,
-                    cache_chunk_size,
-                ),
-            ));
+            let request = RequestState::new(
+                &model,
+                &tokenizer,
+                request_sampler,
+                &work.prompt,
+                work.steps,
+                cache_chunk_size,
+            );
+            metrics.started(request.prompt_tokens.len(), request.cached_len);
+            active.push((work.id, request, work.received_at));
         }
 
-        let mut requests: Vec<_> = active.iter_mut().map(|(_, request)| request).collect();
+        let mut requests: Vec<_> = active.iter_mut().map(|(_, request, _)| request).collect();
+        metrics.batch_step(requests.len());
         step_batch(&mut model, &tokenizer, &mut requests);
 
         let mut i = 0;
         while i < active.len() {
             if active[i].1.is_done() {
-                let (id, request) = active.remove(i);
+                let (id, request, received_at) = active.remove(i);
+                metrics.completed(request.generated_tokens, received_at.elapsed());
                 let (body, _) = request.into_result();
                 if reply_tx
                     .send(ModelReply {
@@ -144,21 +148,24 @@ fn model_worker(
 impl Server {
     /// Starts the model and reply threads.
     pub fn new(
+        host: &str,
         port: u16,
         model: Transformer,
         tokenizer: Tokenizer,
         sampler: Sampler,
         cache_chunk_size: usize,
     ) -> Result<Self, Box<dyn Error>> {
-        let address = format!("127.0.0.1:{port}");
+        let address = format!("{host}:{port}");
         let http = HttpServer::http(&address).map_err(|e| -> Box<dyn Error> { e })?;
         eprintln!("Listening on http://{address}");
         let pending = Arc::new(Mutex::new(HashMap::<RequestId, PendingHttpRequest>::new()));
+        let metrics = Arc::new(Metrics::default());
         let (work_tx, work_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel::<ModelReply>();
 
         let reply_pending = Arc::clone(&pending);
         let reply_thread = thread::spawn(move || reply_worker(reply_pending, reply_rx));
+        let metrics_for_worker = Arc::clone(&metrics);
         let model_thread = thread::spawn(move || {
             model_worker(
                 model,
@@ -167,12 +174,14 @@ impl Server {
                 cache_chunk_size,
                 work_rx,
                 reply_tx,
+                metrics_for_worker,
             )
         });
 
         Ok(Self {
             http,
             pending,
+            metrics,
             next_id: AtomicU64::new(1),
             work_tx,
             model_thread,
@@ -186,6 +195,18 @@ impl Server {
             match (request.method(), request.url()) {
                 (&Method::Get, "/health") => {
                     if let Err(error) = request.respond(response(b"ok\n".to_vec(), 200)) {
+                        eprintln!("response error: {error}");
+                    }
+                }
+                (&Method::Get, "/metrics") => {
+                    let response = Response::from_data(self.metrics.render()).with_header(
+                        Header::from_bytes(
+                            "Content-Type",
+                            "text/plain; version=0.0.4; charset=utf-8",
+                        )
+                        .unwrap(),
+                    );
+                    if let Err(error) = request.respond(response) {
                         eprintln!("response error: {error}");
                     }
                 }

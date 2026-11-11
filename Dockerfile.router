@@ -1,0 +1,9 @@
+FROM rust:1-bookworm AS build
+WORKDIR /app
+COPY rust-port/ ./
+RUN cargo build --release --locked -p llama2-router
+
+FROM debian:bookworm-slim
+COPY --from=build /app/target/release/llama2-router /usr/local/bin/llama2-router
+EXPOSE 8081
+CMD ["llama2-router", "/etc/llama2-router/workers.yaml"]

@@ -31,6 +31,15 @@ pub fn step_batch(
     for request in requests.iter_mut().filter(|request| !request.is_done()) {
         let pos = request.pos;
         let token = request.token;
+        if request.cache_chunk_size > 0 && (pos + 1) % request.cache_chunk_size == 0 {
+            let block_start = pos + 1 - request.cache_chunk_size;
+            request.parent_id = Some(model.cache_block(
+                &request.model_state,
+                request.parent_id,
+                &request.token_history[block_start..pos + 1],
+                block_start,
+            ));
+        }
         let next = if pos + 1 < request.prompt_tokens.len() {
             request.prompt_tokens[pos + 1]
         } else {
@@ -40,17 +49,9 @@ pub fn step_batch(
             request.stopped = true;
             continue;
         }
-        if request.cache_chunk_size > 0
-            && pos + 1 < request.prompt_tokens.len()
-            && (pos + 1) % request.cache_chunk_size == 0
-        {
-            let block_start = pos + 1 - request.cache_chunk_size;
-            request.parent_id = Some(model.cache_block(
-                &request.model_state,
-                request.parent_id,
-                &request.prompt_tokens[block_start..pos + 1],
-                block_start,
-            ));
+        if pos + 1 >= request.prompt_tokens.len() {
+            request.generated_tokens += 1;
+            request.token_history.push(next);
         }
         request.output.extend(tokenizer.decode(token, next));
         request.token = next;

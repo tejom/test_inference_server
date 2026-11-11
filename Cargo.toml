@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 default-run = "llama2-rs"
 
+[workspace]
+members = ["router"]
+resolver = "2"
+
 [dependencies]
 matrixmultiply = "0.3.11"
 memmap2 = "0.9"

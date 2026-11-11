@@ -1,4 +1,5 @@
 mod generation;
+mod metrics;
 mod request;
 #[allow(dead_code)] // Fields reserved for the upcoming scheduler.
 mod server;
@@ -25,6 +26,7 @@ struct Options {
     topp: f32,
     seed: u64,
     port: u16,
+    host: String,
 }
 
 impl Options {
@@ -46,6 +48,7 @@ impl Options {
             topp: 0.9,
             seed: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             port: 8080,
+            host: "127.0.0.1".into(),
         };
         while let Some(flag) = args.next() {
             let value = args.next().ok_or(format!("missing value for {flag}"))?;
@@ -60,6 +63,7 @@ impl Options {
                 "-p" => options.topp = value.parse()?,
                 "-s" => options.seed = value.parse()?,
                 "-P" => options.port = value.parse()?,
+                "-H" => options.host = value,
                 _ => return Err(format!("unknown option: {flag}").into()),
             }
         }
@@ -251,6 +255,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         "chat" => chat(&mut model, &tokenizer, &mut sampler, &options, steps)?,
         "server" => {
             let server = server::Server::new(
+                &options.host,
                 options.port,
                 model,
                 tokenizer,

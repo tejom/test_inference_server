@@ -6,6 +6,9 @@ use llama2_rs::model::{State, Transformer};
 /// Everything needed to resume one generation request at its next token.
 pub struct RequestState {
     pub(crate) prompt_tokens: Vec<usize>,
+    pub(crate) token_history: Vec<usize>,
+    pub(crate) cached_len: usize,
+    pub(crate) generated_tokens: usize,
     pub(crate) token: usize,
     pub(crate) pos: usize,
     steps: usize,
@@ -41,7 +44,10 @@ impl RequestState {
         Self {
             token: prompt_tokens[cached_len],
             pos: cached_len,
+            token_history: prompt_tokens.clone(),
             prompt_tokens,
+            cached_len,
+            generated_tokens: 0,
             steps,
             cache_chunk_size,
             parent_id,
